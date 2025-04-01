@@ -43,12 +43,12 @@ def ring_cv(region, protein_crop, ring, *_):
 
 @ring_metric
 def membrane_vs_cytoplasm(region, protein_img, ring, *_):
-    cell_mask = region.image
-    outer = binary_dilation(cell_mask, disk(2)) ^ cell_mask  # thin outer rim
-    inner = cell_mask.copy()
-    inner[ring] = False  # cytoplasmic = everything not ring
+    cell_mask = region.image  # whole cell
+    membrane = ring           # ring mask represents membrane
+    cytoplasm = cell_mask.copy()
+    cytoplasm[membrane] = False  # exclude membrane to get cytoplasm
 
-    mem_intensity = protein_img[outer].mean()
-    cyt_intensity = protein_img[inner].mean()
+    mem_intensity = protein_img[membrane].mean()
+    cyt_intensity = protein_img[cytoplasm].mean()
 
     return mem_intensity / (cyt_intensity + 1e-6)

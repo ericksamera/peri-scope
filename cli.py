@@ -154,7 +154,7 @@ def cmd_train_grid(args):
     train_model_with_grid(args.csv, rescore=args.rescore)
 
 def cmd_evaluate(args):
-    evaluate_pairs(args.csv)
+    evaluate_pairs(args.csv, out_dir=Path(args.csv).parent)
 
 def cmd_rescore(args):
     scorer = load_scorer(args.weights)
@@ -197,8 +197,9 @@ def cli():
     p_train_grid.add_argument("--rescore", action="store_true", help="Immediately apply best model to create new version")
     p_train_grid.set_defaults(func=cmd_train_grid)
     
-    p_eval = subparsers.add_parser("evaluate")
-    p_eval.add_argument("--csv", required=True, help="Labeled pairs_metadata.csv")
+    p_eval = subparsers.add_parser("evaluate", help="Evaluate scored pairs")
+    p_eval.add_argument("--csv", required=True, help="Path to pairs_metadata.csv with scores")
+    #p_eval.add_argument("--out-dir", help="Directory to save evaluation plots (PNG)")
     p_eval.set_defaults(func=cmd_evaluate)
 
     p_rescore = subparsers.add_parser("rescore")

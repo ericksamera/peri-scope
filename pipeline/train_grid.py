@@ -42,6 +42,8 @@ def train_model_with_grid(csv_path, rescore=False):
     df = df.dropna(subset=["label"])
     y = LabelEncoder().fit_transform(df["label"])
     X = df.drop(columns=[c for c in df.columns if c in NON_FEATURE_COLS], errors="ignore")
+    X = X.select_dtypes(include=[np.number])
+
 
     log.info(f"Training with grid search on {len(X)} labeled samples...")
 
@@ -80,7 +82,7 @@ def train_model_with_grid(csv_path, rescore=False):
     if rescore:
         new_version_id = get_next_version_id(run_dir / "versions")
         log.info(f"Applying trained model to same run for rescoring (→ version {new_version_id}) in {versions_dir}")
-        _apply_model_to_run(best_model, list(X.columns), run_id, new_version_id)
+        _apply_model_to_run(best_model, list(X.columns), run_id, new_version_id, original_csv=csv_path)
 
         # 🚨 This is the fix: now we redirect saving into the rescored version folder
         version_dir = run_dir / "versions" / f"{new_version_id}"
@@ -110,7 +112,7 @@ def train_model_with_grid(csv_path, rescore=False):
     log.info(f"Training metadata saved to {version_dir / 'train_metadata.json'}")
 
 
-def _apply_model_to_run(model, feature_order, run_id, version_id):
+def _apply_model_to_run(model, feature_order, run_id, version_id, original_csv=None):
     paths = get_output_paths(run_id, version_id)
     paths["version"].mkdir(parents=True, exist_ok=True)
 
@@ -127,7 +129,6 @@ def _apply_model_to_run(model, feature_order, run_id, version_id):
 
     scorer = MLScorer(model, feature_order)
 
-    # ✅ Ensure rescored samples get fresh rings
     ring_mask = extract_rings(
         membrane_img, samples, norm_protein, scorer, frangi_img, debug=False
     )
@@ -144,3 +145,19 @@ def _apply_model_to_run(model, feature_order, run_id, version_id):
         run_id=run_id,
         version_id=version_id
     )
+
+    if original_csv and Path(original_csv).exists():
+        df_old = pd.read_csv(original_csv)
+        df_new = pd.read_csv(paths["csv"])
+
+        cols_to_restore = ["label", "condition", "source_img"]
+        merge_cols = [col for col in cols_to_restore if col in df_old.columns]
+
+        if merge_cols:
+            merged = pd.merge(df_new, df_old[["cell_label"] + merge_cols], on="cell_label", how="left")
+            merged.to_csv(paths["csv"], index=False)
+            log.info(f"Restored columns {merge_cols} from {original_csv} into {paths['csv']}")
+        else:
+            log.warning(f"No metadata columns found to restore from {original_csv}")
+    else:
+        log.warning(f"No original CSV found to restore metadata: {original_csv}")

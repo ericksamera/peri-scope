@@ -1,12 +1,15 @@
 # evaluation/evaluate.py
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # Use non-GUI backend for headless environments
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, roc_auc_score, roc_curve, precision_recall_curve
 from pipeline.logger import get_logger
+from pathlib import Path
 
 log = get_logger(__name__)
 
-def evaluate_pairs(csv_path):
+def evaluate_pairs(csv_path, out_dir=None):
     df = pd.read_csv(csv_path)
     if 'label' not in df.columns or 'score' not in df.columns:
         raise ValueError("CSV must contain 'label' and 'score' columns")
@@ -28,10 +31,10 @@ def evaluate_pairs(csv_path):
     except Exception as e:
         log.warning(f"AUC computation failed: {e}")
 
-    plot_score_distributions(df)
-    plot_roc_pr_curves(y_true, y_score)
+    plot_score_distributions(df, out_dir)
+    plot_roc_pr_curves(y_true, y_score, out_dir)
 
-def plot_score_distributions(df):
+def plot_score_distributions(df, out_dir=None):
     plt.figure(figsize=(6, 4))
     df_good = df[df["label"] == "good"]
     df_bad = df[df["label"] == "bad"]
@@ -42,9 +45,14 @@ def plot_score_distributions(df):
     plt.title("Score Distribution by Label")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    if out_dir:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        plt.savefig(Path(out_dir) / "score_distribution.png", dpi=300)
+    else:
+        plt.show()
+    plt.close()
 
-def plot_roc_pr_curves(y_true, y_score):
+def plot_roc_pr_curves(y_true, y_score, out_dir=None):
     fpr, tpr, _ = roc_curve(y_true, y_score)
     prec, rec, _ = precision_recall_curve(y_true, y_score)
 
@@ -66,4 +74,10 @@ def plot_roc_pr_curves(y_true, y_score):
     plt.grid(True)
 
     plt.tight_layout()
-    plt.show()
+
+    if out_dir:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        plt.savefig(Path(out_dir) / "roc_pr_curves.png", dpi=300)
+    else:
+        plt.show()
+    plt.close()
