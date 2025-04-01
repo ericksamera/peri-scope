@@ -20,7 +20,8 @@ def export_protein_ring_pairs(
         condition_label=None,
         source_img=None,
         run_id=None,
-        version_id=None
+        version_id=None,
+        skip_crops=False
     ):
 
 
@@ -62,8 +63,9 @@ def export_protein_ring_pairs(
 
         rows.append(sample.to_row())
 
-        out_path = crop_dir / f"cell_{sample.cell_id:03d}.png"
-        save_ring_crop(protein_img, sample.ring_mask, sample.cell_mask, out_path)
+        if not skip_crops:
+            out_path = crop_dir / f"cell_{sample.cell_id:03d}.png"
+            save_ring_crop(protein_img, sample.ring_mask, sample.cell_mask, out_path)
 
     if not rows:
         log.warning("No protein+ring pairs were exported.")

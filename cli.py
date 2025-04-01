@@ -14,7 +14,8 @@ from pipeline.segmentation import segment_cells
 from pipeline.ring_detection import extract_rings
 from pipeline.train_grid import train_model_with_grid
 from pipeline.export import export_protein_ring_pairs
-from pipeline.utils import normalize_image
+from pipeline.utils import normalize_image, get_next_version_id
+
 from pipeline.logger import get_logger
 from pipeline.scorer import RuleBasedScorer, MLScorer
 from pipeline.train import train_classifier
@@ -25,8 +26,7 @@ import logging
 from config import get_output_paths
 
 from pipeline.sample import CellSample
-
-import re
+import config
 
 log_file = Path("peri-scope.log")
 file_handler = logging.FileHandler(log_file, mode='a')
@@ -47,27 +47,6 @@ def load_tiff_channels(tif_path):
     membrane = np.array(img.copy())
     return protein, membrane
 
-def get_next_version_id(root_dir, prefix="version"):
-    """
-    Get the next version ID like '001' by scanning subdirectories matching 'prefix_###'
-    """
-    root_dir = Path(root_dir)
-    root_dir.mkdir(parents=True, exist_ok=True)
-
-    version_re = re.compile(rf"^{re.escape(prefix)}_(\d+)$")
-    ids = []
-
-    for entry in root_dir.iterdir():
-        if entry.is_dir():
-            match = version_re.match(entry.name)
-            if match:
-                ids.append(int(match.group(1)))
-            else:
-                log.debug(f"Skipping non-matching entry: {entry.name}")
-
-    next_id = max(ids) + 1 if ids else 1
-    return f"{next_id:03d}"
-
 def save_metadata(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -80,8 +59,43 @@ def load_scorer(path):
     else:
         raise ValueError("Unsupported scorer format. Use .json or .pkl")
 
+
+def apply_config_overrides(override_str):
+    if not override_str:
+        return
+
+    for pair in override_str.split(","):
+        if "=" not in pair:
+            continue
+        key, val = pair.split("=")
+        key = key.strip()
+        val = val.strip()
+
+        # Try to infer the correct type
+        if hasattr(config, key):
+            current = getattr(config, key)
+            try:
+                if isinstance(current, bool):
+                    val = val.lower() in ("1", "true", "yes", "on")
+                elif isinstance(current, int):
+                    val = int(val)
+                elif isinstance(current, float):
+                    val = float(val)
+                else:
+                    val = str(val)
+                setattr(config, key, val)
+                log.info(f"[override] {key} = {val}")
+            except Exception as e:
+                log.warning(f"Could not override {key}: {e}")
+        else:
+            log.warning(f"[override] Unknown config key: {key}")
+
+
 def cmd_detect_export(args):
-    run_id = get_next_version_id(OUTPUTS_DIR, prefix="run")
+
+    apply_config_overrides(args.override)
+
+    run_id = get_next_version_id(OUTPUTS_DIR, prefix="")
     run_path = Path(OUTPUTS_DIR) / f"{run_id}"
     version_id = get_next_version_id(run_path / "versions")
 
@@ -185,6 +199,7 @@ def cli():
     p_detect.add_argument("--label", help="Condition label (e.g., WT, mutant) to include in export")
     p_detect.add_argument("--weights", help="Path to scorer (.json or .pkl)")
     p_detect.add_argument("--debug", action="store_true", help="Enable debug overlays and visual outputs")
+    p_detect.add_argument("--override", help="Comma-separated list of config overrides, e.g. 'CELLPOSE_DIAMETER=90,RING_WIDTH_SCALE=0.3'")
     p_detect.set_defaults(func=cmd_detect_export)
 
     p_train = subparsers.add_parser("train", help="Train a new model based on labeled data")

@@ -12,12 +12,11 @@ RING_DILATE_PX = 1
 RING_PERCENTILE_CUTOFF = 5.0
 MIN_CELL_AREA = 10
 
-RING_WIDTH_PX = 3
-RING_INTENSITY_CUTOFF = 10
+RING_INTENSITY_CUTOFF = 25
 
 RING_WIDTH_SCALE = 0.2
 RING_WIDTH_MIN = 2
-RING_WIDTH_MAX = 8
+RING_WIDTH_MAX = 20
 
 # Default rule-based scorer weights
 DEFAULT_SCORER = {
@@ -45,6 +44,6 @@ def get_output_paths(run_id: str, version_id: str):
         "overlay": run_base / "debug",
         "metadata": run_base / "metadata.json",
         "source_metadata": version_base / "source_metadata.json",
-        "crops": version_base / "crops",
+        "crops": run_base / "crops",
         "csv": version_base / "pairs_metadata.csv",
     }

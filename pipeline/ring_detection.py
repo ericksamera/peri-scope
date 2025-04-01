@@ -83,6 +83,8 @@ log = get_logger(__name__)
 
 #     return ring_mask
 
+
+
 from config import RING_WIDTH_SCALE, RING_WIDTH_MIN, RING_WIDTH_MAX, RING_DILATE_PX, RING_INTENSITY_CUTOFF
 
 def extract_rings(membrane_img, samples: List[CellSample], protein_img=None, scorer=None, frangi_img=None, debug=False, debug_dir=None) -> np.ndarray:
