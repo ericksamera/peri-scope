@@ -9,6 +9,22 @@ from config import CROP_PADDING, RING_OVERLAY_ALPHA
 
 log = get_logger(__name__)
 
+def tile_images(images, rows, cols):
+    if not images:
+        raise ValueError("No images to tile.")
+
+    w, h = images[0].size
+    grid = Image.new("RGB", (cols * w, rows * h), "white")
+
+    for idx, img in enumerate(images):
+        if idx >= rows * cols:
+            break
+        x = (idx % cols) * w
+        y = (idx // cols) * h
+        grid.paste(img, (x, y))
+
+    return grid
+
 def overlay_rings(protein_img, membrane_img, cell_labels, ring_mask, out_dir="debug_overlays"):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     overlay_path = Path(out_dir) / "overlay.png"

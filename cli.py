@@ -1,11 +1,10 @@
 # cli.py
 import argparse
 import json
-import numpy as np
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from PIL import Image
+from pipeline.utils import load_tiff_channels
 from skimage.filters import frangi
 from skimage.measure import regionprops
 from pipeline.apply_cnn import apply_cnn_model
@@ -16,12 +15,15 @@ from pipeline.train_grid import train_model_with_grid
 from pipeline.export import export_protein_ring_pairs
 from pipeline.utils import normalize_image, get_next_version_id
 
+from concurrent.futures import ThreadPoolExecutor
+
 from pipeline.logger import get_logger
 from pipeline.scorer import RuleBasedScorer, MLScorer
 from pipeline.train import train_classifier
 from evaluation.evaluate import evaluate_pairs
 from config import OUTPUTS_DIR, DEFAULT_SCORER, MIN_CELL_AREA
 import logging
+from itertools import count
 
 from config import get_output_paths
 
@@ -38,15 +40,6 @@ root_logger.setLevel(logging.DEBUG)
 
 log = get_logger(__name__)
 
-def load_tiff_channels(tif_path):
-    log.debug(f"Loading TIFF: {tif_path}")
-    img = Image.open(tif_path)
-    img.seek(0)
-    protein = np.array(img.copy())
-    img.seek(1)
-    membrane = np.array(img.copy())
-    return protein, membrane
-
 def save_metadata(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
@@ -58,6 +51,78 @@ def load_scorer(path):
         return MLScorer.load(path)
     else:
         raise ValueError("Unsupported scorer format. Use .json or .pkl")
+
+
+def process_tif(tif_path, label, scorer, run_id, version_id, paths, debug, current_cell_id):
+    from shutil import copy2
+    from datetime import datetime
+    from pathlib import Path
+
+    log.info(f"🔍 Processing {tif_path} [label: {label}]")
+    copy2(tif_path, paths["run"] / Path(tif_path).name)
+
+    protein_img, membrane_img = load_tiff_channels(tif_path)
+    norm_membrane = normalize_image(membrane_img)
+    norm_protein = normalize_image(protein_img)
+    frangi_img = frangi(norm_membrane)
+
+    cell_labels = segment_cells(norm_membrane, out_dir=paths["debug_cells"], debug=debug)
+    samples = []
+
+    for region in regionprops(cell_labels):
+        if region.area >= MIN_CELL_AREA:
+            sample = CellSample(next(current_cell_id), region, cell_labels == region.label)
+            sample._membrane_img = membrane_img
+            sample._norm_protein = norm_protein
+            sample._frangi_img = frangi_img
+            sample.meta.update({
+                "condition": label,
+                "source_img": tif_path,
+                "run_id": run_id,
+                "version_id": version_id,
+            })
+            samples.append(sample)
+
+    if not samples:
+        log.warning(f"No valid cells found in {tif_path}")
+        return [], None
+
+    if debug:
+        ring_mask = extract_rings(
+            membrane_img, samples, norm_protein, scorer, frangi_img,
+            debug=True, debug_dir=paths["debug_cells"]
+        )
+        overlay_rings(
+            norm_protein,
+            membrane_img,
+            cell_labels,
+            ring_mask,
+            out_dir=paths["run"] / "debug" / Path(tif_path).stem
+        )
+    else:
+        ring_mask = extract_rings(membrane_img, samples, norm_protein, scorer, frangi_img, debug=False)
+
+    export_protein_ring_pairs(
+        samples=samples,
+        scorer=scorer,
+        paths=paths,
+        condition_label=label,
+        source_img=tif_path,
+        run_id=run_id,
+        version_id=version_id
+    )
+
+    meta = {
+        "tif": tif_path,
+        "condition": label,
+        "source_img": tif_path,
+        "scorer_type": scorer.__class__.__name__,
+        "timestamp": datetime.now().isoformat(),
+        "run_id": run_id,
+        "version_id": version_id,
+    }
+
+    return samples, meta
 
 
 def apply_config_overrides(override_str):
@@ -90,76 +155,56 @@ def apply_config_overrides(override_str):
         else:
             log.warning(f"[override] Unknown config key: {key}")
 
-
 def cmd_detect_export(args):
 
-    apply_config_overrides(args.override)
-
-    run_id = get_next_version_id(OUTPUTS_DIR, prefix="")
+    run_id = get_next_version_id(OUTPUTS_DIR, prefix="run")
     run_path = Path(OUTPUTS_DIR) / f"{run_id}"
     version_id = get_next_version_id(run_path / "versions")
-
     paths = get_output_paths(run_id, version_id)
     run_path.mkdir(parents=True, exist_ok=True)
     paths["version"].mkdir(parents=True, exist_ok=True)
 
-    protein_img, membrane_img = load_tiff_channels(args.tif)
-    norm_membrane = normalize_image(membrane_img)
-    norm_protein = normalize_image(protein_img)
-    frangi_img = frangi(norm_membrane)
-
-    # Perform segmentation and save debug for each cell
-    cell_labels = segment_cells(norm_membrane, out_dir=paths["debug_cells"], debug=args.debug)
-    samples = [
-        CellSample(region.label, region, cell_labels == region.label)
-        for region in regionprops(cell_labels)
-        if region.area >= MIN_CELL_AREA
-    ]
-
-    if args.weights:
-        scorer = load_scorer(args.weights)
+    # Pair TIFFs and labels
+    if args.label:
+        if len(args.label) != len(args.tif):
+            raise ValueError("Number of --label entries must match number of --tif files")
+        tif_label_pairs = list(zip(args.tif, args.label))
     else:
-        scorer = RuleBasedScorer(weights=DEFAULT_SCORER["weights"], bias=DEFAULT_SCORER["bias"])
-    
-    debug_dir = paths["debug_cells"] if args.debug else None
-    ring_mask = extract_rings(membrane_img, samples, norm_protein, scorer, frangi_img, debug=args.debug, debug_dir=debug_dir)
+        tif_label_pairs = [(tif, args.label) for tif in args.tif]
 
-    # Saving intermediate results for future analysis
-    np.save(run_path / "cell_labels.npy", cell_labels)
-    np.save(run_path / "ring_mask.npy", ring_mask)
-    np.save(run_path / "protein_img.npy", norm_protein)
-    np.save(run_path / "membrane_img.npy", membrane_img)
-
-    metadata = {
-        "tif": args.tif,
-        "scorer_type": scorer.__class__.__name__,
-        "timestamp": datetime.now().isoformat(),
-        "run_id": run_id,
-        "version_id": version_id
-    }
-    save_metadata(paths["metadata"], metadata)
-    save_metadata(paths["source_metadata"], metadata)
-
-    # Export the results
-    export_protein_ring_pairs(
-        samples,
-        membrane_img,
-        norm_protein,
-        frangi_img,
-        scorer,
-        paths=paths,
-        condition_label=args.label,
-        source_img=args.tif,
-        run_id=run_id,
-        version_id=version_id
+    # Initialize scorer once
+    scorer = load_scorer(args.weights) if args.weights else RuleBasedScorer(
+        weights=DEFAULT_SCORER["weights"],
+        bias=DEFAULT_SCORER["bias"]
     )
 
+    all_samples = []
+    current_cell_id = count(1)
+    all_metadata = []
 
-    # Overlay the protein + membrane + rings (visual debug)
-    if args.debug:
-        overlay_rings(norm_protein, membrane_img, cell_labels, ring_mask, out_dir=run_path / "debug")
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(
+                process_tif, tif_path, label, scorer, run_id, version_id, paths, args.debug, current_cell_id
+            )
+            for tif_path, label in tif_label_pairs
+        ]
+
+        all_samples = []
+        all_metadata = []
+        for fut in futures:
+            samples, meta = fut.result()
+            if samples:
+                all_samples.extend(samples)
+            if meta:
+                all_metadata.append(meta)
+
+
+    save_metadata(paths["metadata"], {"inputs": all_metadata})
+    save_metadata(paths["source_metadata"], {"inputs": all_metadata})
 
     log.info(f"✅ Done: run_{run_id} → version {version_id}")
+
 
 def cmd_train(args):
     train_classifier(args.csv, rescore=args.rescore)
@@ -194,13 +239,24 @@ def cli():
     parser = argparse.ArgumentParser(description="peri-scope CLI")
     subparsers = parser.add_subparsers(dest="command")
 
-    p_detect = subparsers.add_parser("detect-export")
-    p_detect.add_argument("--tif", required=True)
-    p_detect.add_argument("--label", help="Condition label (e.g., WT, mutant) to include in export")
+    p_detect = subparsers.add_parser("detect-export", help="Detect and export membrane-localized protein rings")
+    p_detect.add_argument(
+        "--tif",
+        action="append",
+        required=True,
+        help="Path to input TIFF (channel 0 = protein, 1 = membrane). Repeat to pass multiple images."
+    )
+    p_detect.add_argument(
+        "--label",
+        action="append",
+        required=False,
+        help="Condition label(s) per TIFF (must match order of --tif)"
+    )
     p_detect.add_argument("--weights", help="Path to scorer (.json or .pkl)")
     p_detect.add_argument("--debug", action="store_true", help="Enable debug overlays and visual outputs")
-    p_detect.add_argument("--override", help="Comma-separated list of config overrides, e.g. 'CELLPOSE_DIAMETER=90,RING_WIDTH_SCALE=0.3'")
+    p_detect.add_argument("--override", help="Comma-separated config overrides like CELLPOSE_DIAMETER=90")
     p_detect.set_defaults(func=cmd_detect_export)
+
 
     p_train = subparsers.add_parser("train", help="Train a new model based on labeled data")
     p_train.add_argument("--csv", required=True, help="Path to labeled pairs_metadata.csv")

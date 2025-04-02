@@ -4,15 +4,50 @@ import numpy as np
 from pathlib import Path
 from pipeline.logger import get_logger
 
+from PIL import Image
+
 import torch
 from torchvision.models import resnet18
 import torch.nn as nn
+import config
 
 log = get_logger(__name__)
 
-def normalize_image(img: np.ndarray) -> np.ndarray:
-    log.debug(f"Normalizing image of shape {img.shape}")
-    return (img - img.min()) / (np.ptp(img) + 1e-6)
+
+def load_tiff_channels(tif_path):
+    img = Image.open(tif_path)
+    img.seek(0)
+    protein = np.array(img.copy())
+    img.seek(1)
+    membrane = np.array(img.copy())
+    return protein, membrane
+
+
+def normalize_image(img):
+    method = config.NORM_METHOD.lower()
+    img = img.astype(np.float32)
+
+    if method == "minmax":
+        return (img - img.min()) / (img.max() - img.min() + 1e-8)
+
+    elif method == "percentile":
+        pmin = np.percentile(img, config.PERCENTILE_MIN)
+        pmax = np.percentile(img, config.PERCENTILE_MAX)
+        return np.clip((img - pmin) / (pmax - pmin + 1e-8), 0, 1)
+
+    elif method == "zscore":
+        mean = img.mean()
+        std = img.std()
+        return (img - mean) / (std + 1e-8)
+
+    elif method == "mad":
+        median = np.median(img)
+        mad = np.median(np.abs(img - median))
+        return (img - median) / (mad + 1e-8)
+
+    else:
+        raise ValueError(f"Unknown normalization method: {method}")
+
 
 def get_next_version_id(versions_root, prefix=""):
     versions_root = Path(versions_root)

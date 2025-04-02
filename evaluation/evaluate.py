@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, roc_auc_score, roc_curve, precision_recall_curve
 from pipeline.logger import get_logger
 from pathlib import Path
+from evaluate.thresholding import suggest_otsu_threshold, suggest_best_f1_threshold
 
 log = get_logger(__name__)
 
@@ -18,9 +19,13 @@ def evaluate_pairs(csv_path, out_dir=None):
     if df.empty:
         raise ValueError("No labeled examples found for evaluation")
 
+    if "label" in df.columns:
+        thresh, f1 = suggest_best_f1_threshold(df["score"], df["label"])
+        log.info(f"Suggested threshold (F1 max): {thresh:.3f} (F1 = {f1:.2f})")
+
     y_true = df['label'].map({'bad': 0, 'good': 1}).values
     y_score = df['score'].values
-    y_pred = (y_score >= 0.5).astype(int)
+    y_pred = (y_score >= thresh).astype(int)
 
     print("\n🔍 Classification Report:")
     print(classification_report(y_true, y_pred, target_names=['bad', 'good'], digits=3))

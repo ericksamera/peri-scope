@@ -1,0 +1,1731 @@
+# cli.py
+import argparse
+import json
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+from pipeline.utils import load_tiff_channels
+from skimage.filters import frangi
+from skimage.measure import regionprops
+from pipeline.apply_cnn import apply_cnn_model
+from pipeline.visualize import overlay_rings
+from pipeline.segmentation import segment_cells
+from pipeline.ring_detection import extract_rings
+from pipeline.train_grid import train_model_with_grid
+from pipeline.export import export_protein_ring_pairs
+from pipeline.utils import normalize_image, get_next_version_id
+
+from concurrent.futures import ThreadPoolExecutor
+
+from pipeline.logger import get_logger
+from pipeline.scorer import RuleBasedScorer, MLScorer
+from pipeline.train import train_classifier
+from evaluation.evaluate import evaluate_pairs
+from config import OUTPUTS_DIR, DEFAULT_SCORER, MIN_CELL_AREA
+import logging
+from itertools import count
+
+from config import get_output_paths
+
+from pipeline.sample import CellSample
+import config
+
+log_file = Path("peri-scope.log")
+file_handler = logging.FileHandler(log_file, mode='a')
+file_formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+file_handler.setFormatter(file_formatter)
+root_logger = logging.getLogger()
+root_logger.addHandler(file_handler)
+root_logger.setLevel(logging.DEBUG)
+
+log = get_logger(__name__)
+
+def save_metadata(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def load_scorer(path):
+    if path.endswith(".json"):
+        return RuleBasedScorer.load(path)
+    elif path.endswith(".pkl"):
+        return MLScorer.load(path)
+    else:
+        raise ValueError("Unsupported scorer format. Use .json or .pkl")
+
+
+def process_tif(tif_path, label, scorer, run_id, version_id, paths, debug, current_cell_id):
+    from shutil import copy2
+    from datetime import datetime
+    from pathlib import Path
+
+    log.info(f"🔍 Processing {tif_path} [label: {label}]")
+    copy2(tif_path, paths["run"] / Path(tif_path).name)
+
+    protein_img, membrane_img = load_tiff_channels(tif_path)
+    norm_membrane = normalize_image(membrane_img)
+    norm_protein = normalize_image(protein_img)
+    frangi_img = frangi(norm_membrane)
+
+    cell_labels = segment_cells(norm_membrane, out_dir=paths["debug_cells"], debug=debug)
+    samples = []
+
+    for region in regionprops(cell_labels):
+        if region.area >= MIN_CELL_AREA:
+            sample = CellSample(next(current_cell_id), region, cell_labels == region.label)
+            sample._membrane_img = membrane_img
+            sample._norm_protein = norm_protein
+            sample._frangi_img = frangi_img
+            sample.meta.update({
+                "condition": label,
+                "source_img": tif_path,
+                "run_id": run_id,
+                "version_id": version_id,
+            })
+            samples.append(sample)
+
+    if not samples:
+        log.warning(f"No valid cells found in {tif_path}")
+        return [], None
+
+    if debug:
+        ring_mask = extract_rings(
+            membrane_img, samples, norm_protein, scorer, frangi_img,
+            debug=True, debug_dir=paths["debug_cells"]
+        )
+        overlay_rings(
+            norm_protein,
+            membrane_img,
+            cell_labels,
+            ring_mask,
+            out_dir=paths["run"] / "debug" / Path(tif_path).stem
+        )
+    else:
+        ring_mask = extract_rings(membrane_img, samples, norm_protein, scorer, frangi_img, debug=False)
+
+    export_protein_ring_pairs(
+        samples=samples,
+        scorer=scorer,
+        paths=paths,
+        condition_label=label,
+        source_img=tif_path,
+        run_id=run_id,
+        version_id=version_id
+    )
+
+    meta = {
+        "tif": tif_path,
+        "condition": label,
+        "source_img": tif_path,
+        "scorer_type": scorer.__class__.__name__,
+        "timestamp": datetime.now().isoformat(),
+        "run_id": run_id,
+        "version_id": version_id,
+    }
+
+    return samples, meta
+
+
+def apply_config_overrides(override_str):
+    if not override_str:
+        return
+
+    for pair in override_str.split(","):
+        if "=" not in pair:
+            continue
+        key, val = pair.split("=")
+        key = key.strip()
+        val = val.strip()
+
+        # Try to infer the correct type
+        if hasattr(config, key):
+            current = getattr(config, key)
+            try:
+                if isinstance(current, bool):
+                    val = val.lower() in ("1", "true", "yes", "on")
+                elif isinstance(current, int):
+                    val = int(val)
+                elif isinstance(current, float):
+                    val = float(val)
+                else:
+                    val = str(val)
+                setattr(config, key, val)
+                log.info(f"[override] {key} = {val}")
+            except Exception as e:
+                log.warning(f"Could not override {key}: {e}")
+        else:
+            log.warning(f"[override] Unknown config key: {key}")
+
+def cmd_detect_export(args):
+
+    run_id = get_next_version_id(OUTPUTS_DIR, prefix="run")
+    run_path = Path(OUTPUTS_DIR) / f"{run_id}"
+    version_id = get_next_version_id(run_path / "versions")
+    paths = get_output_paths(run_id, version_id)
+    run_path.mkdir(parents=True, exist_ok=True)
+    paths["version"].mkdir(parents=True, exist_ok=True)
+
+    # Pair TIFFs and labels
+    if args.label:
+        if len(args.label) != len(args.tif):
+            raise ValueError("Number of --label entries must match number of --tif files")
+        tif_label_pairs = list(zip(args.tif, args.label))
+    else:
+        tif_label_pairs = [(tif, args.label) for tif in args.tif]
+
+    # Initialize scorer once
+    scorer = load_scorer(args.weights) if args.weights else RuleBasedScorer(
+        weights=DEFAULT_SCORER["weights"],
+        bias=DEFAULT_SCORER["bias"]
+    )
+
+    all_samples = []
+    current_cell_id = count(1)
+    all_metadata = []
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(
+                process_tif, tif_path, label, scorer, run_id, version_id, paths, args.debug, current_cell_id
+            )
+            for tif_path, label in tif_label_pairs
+        ]
+
+        all_samples = []
+        all_metadata = []
+        for fut in futures:
+            samples, meta = fut.result()
+            if samples:
+                all_samples.extend(samples)
+            if meta:
+                all_metadata.append(meta)
+
+
+    save_metadata(paths["metadata"], {"inputs": all_metadata})
+    save_metadata(paths["source_metadata"], {"inputs": all_metadata})
+
+    log.info(f"✅ Done: run_{run_id} → version {version_id}")
+
+
+def cmd_train(args):
+    train_classifier(args.csv, rescore=args.rescore)
+
+def cmd_train_grid(args):
+    train_model_with_grid(args.csv, rescore=args.rescore)
+
+def cmd_evaluate(args):
+    evaluate_pairs(args.csv, out_dir=Path(args.csv).parent)
+
+def cmd_rescore(args):
+    scorer = load_scorer(args.weights)
+    df = pd.read_csv(args.csv)
+    feature_cols = [c for c in df.columns if c not in ("label", "score", "cell_label", "bbox_minr", "bbox_minc", "bbox_maxr", "bbox_maxc")]
+
+    new_scores = []
+    for _, row in df.iterrows():
+        features = {k: row[k] for k in feature_cols if pd.notna(row[k])}
+        score = scorer.score(features)
+        new_scores.append(score)
+
+    if args.backup:
+        backup_path = Path(args.csv).with_suffix(".bak.csv")
+        df.to_csv(backup_path, index=False)
+        log.info(f"Original file backed up to {backup_path}")
+
+    df["score"] = new_scores
+    df.to_csv(args.csv, index=False)
+    log.info(f"Updated scores written to {args.csv}")
+
+def cli():
+    parser = argparse.ArgumentParser(description="peri-scope CLI")
+    subparsers = parser.add_subparsers(dest="command")
+
+    p_detect = subparsers.add_parser("detect-export", help="Detect and export membrane-localized protein rings")
+    p_detect.add_argument(
+        "--tif",
+        action="append",
+        required=True,
+        help="Path to input TIFF (channel 0 = protein, 1 = membrane). Repeat to pass multiple images."
+    )
+    p_detect.add_argument(
+        "--label",
+        action="append",
+        required=False,
+        help="Condition label(s) per TIFF (must match order of --tif)"
+    )
+    p_detect.add_argument("--weights", help="Path to scorer (.json or .pkl)")
+    p_detect.add_argument("--debug", action="store_true", help="Enable debug overlays and visual outputs")
+    p_detect.add_argument("--override", help="Comma-separated config overrides like CELLPOSE_DIAMETER=90")
+    p_detect.set_defaults(func=cmd_detect_export)
+
+
+    p_train = subparsers.add_parser("train", help="Train a new model based on labeled data")
+    p_train.add_argument("--csv", required=True, help="Path to labeled pairs_metadata.csv")
+    p_train.add_argument("--rescore", action="store_true", help="Immediately apply trained model to create a new version")
+    p_train.set_defaults(func=cmd_train)
+
+    p_train_grid = subparsers.add_parser("train-grid", help="Train classifier with grid search")
+    p_train_grid.add_argument("--csv", required=True, help="Path to labeled pairs_metadata.csv")
+    p_train_grid.add_argument("--rescore", action="store_true", help="Immediately apply best model to create new version")
+    p_train_grid.set_defaults(func=cmd_train_grid)
+    
+    p_eval = subparsers.add_parser("evaluate", help="Evaluate scored pairs")
+    p_eval.add_argument("--csv", required=True, help="Path to pairs_metadata.csv with scores")
+    #p_eval.add_argument("--out-dir", help="Directory to save evaluation plots (PNG)")
+    p_eval.set_defaults(func=cmd_evaluate)
+
+    p_rescore = subparsers.add_parser("rescore")
+    p_rescore.add_argument("--csv", required=True, help="pairs_metadata.csv to update")
+    p_rescore.add_argument("--weights", required=True, help="New scorer weights (.json or .pkl)")
+    p_rescore.add_argument("--backup", action="store_true", help="Backup original file")
+    p_rescore.set_defaults(func=cmd_rescore)
+
+    p_apply_cnn = subparsers.add_parser("apply-cnn", help="Apply trained CNN model to ring crops and create new version")
+    p_apply_cnn.add_argument("--csv", required=True, help="Path to pairs_metadata.csv")
+    p_apply_cnn.add_argument("--model", required=True, help="Path to trained CNN model (.pt)")
+    p_apply_cnn.add_argument("--threshold", type=float, default=0.5, help="Threshold for good/bad classification")
+    p_apply_cnn.add_argument("--device", default="cpu", help="Device to run model (e.g. cpu, cuda)")
+    p_apply_cnn.add_argument("--no-eval", dest="evaluate", action="store_false", help="Skip evaluation after scoring")
+    p_apply_cnn.set_defaults(func=lambda args: apply_cnn_model(args.csv, args.model, args.device, args.threshold, args.evaluate))
+
+
+    args = parser.parse_args()
+    if hasattr(args, "func"):
+        args.func(args)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    cli()# cnn/dataset.py
+from pathlib import Path
+from PIL import Image
+from torch.utils.data import Dataset
+import torchvision.transforms as T
+
+class RingCropDataset(Dataset):
+    def __init__(self, csv_path, transform=None):
+        import pandas as pd
+        self.df = pd.read_csv(csv_path)
+        self.df = self.df[self.df["label"].isin(["good", "bad"])]
+        self.img_paths = self.df["cell_label"].apply(
+            lambda x: Path(csv_path).parent / "crops" / f"cell_{int(x):03d}.png"
+        )
+        self.labels = self.df["label"].map({"bad": 0, "good": 1}).tolist()
+        self.transform = transform or T.Compose([
+            T.Resize((128, 128)),
+            T.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.img_paths.iloc[idx]).convert("RGB")
+        img = self.transform(img)
+        label = self.labels[idx]
+        return img, label
+# cnn/train_cnn.py
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from torchvision.models import resnet18
+from dataset import RingCropDataset
+from sklearn.metrics import classification_report
+import json
+from pathlib import Path
+from datetime import datetime
+
+def train_cnn(csv_path, out_dir="cnn_model", epochs=10, batch_size=32, lr=1e-4):
+    dataset = RingCropDataset(csv_path)
+    train_len = int(0.8 * len(dataset))
+    val_len = len(dataset) - train_len
+    train_ds, val_ds = random_split(dataset, [train_len, val_len])
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size)
+
+    model = resnet18(pretrained=False, num_classes=2)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    for epoch in range(epochs):
+        model.train()
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(x), y)
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
+
+    # Evaluate
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for x, y in val_loader:
+            x = x.to(device)
+            logits = model(x)
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            y_pred.extend(preds)
+            y_true.extend(y.numpy())
+
+    print("\nValidation Report:")
+    print(classification_report(y_true, y_pred, target_names=["bad", "good"]))
+
+    # Save
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), Path(out_dir) / "cnn_model.pt")
+
+    with open(Path(out_dir) / "train_metadata.json", "w") as f:
+        json.dump({
+            "timestamp": datetime.now().isoformat(),
+            "csv": str(csv_path),
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+        }, f, indent=2)
+
+    print(f"✅ Saved model to {Path(out_dir) / 'cnn_model.pt'}")
+# config.py
+from pathlib import Path
+
+# Segmentation
+CELLPOSE_MODEL_TYPE = "cyto2"
+CELLPOSE_DIAMETER = 70
+CELLPOSE_MIN_AREA = 50
+
+# Ring detection
+RING_SCALES = (0.1, 0.4)
+RING_DILATE_PX = 1
+RING_PERCENTILE_CUTOFF = 5.0
+MIN_CELL_AREA = 10
+
+RING_INTENSITY_CUTOFF = 25
+
+RING_WIDTH_SCALE = 0.2
+RING_WIDTH_MIN = 2
+RING_WIDTH_MAX = 20
+
+# Default rule-based scorer weights
+DEFAULT_SCORER = {
+    "weights": {
+        "protein_mean": 1.0,
+        "frangi_mean": 0.5,
+        "solidity": 0.2,
+        "eccentricity": -0.1
+    },
+    "bias": -0.2
+}
+
+NORM_METHOD = "minmax"  # Options: "minmax", "percentile", "zscore", "mad"
+
+PERCENTILE_MIN = 1
+PERCENTILE_MAX = 99
+
+# Output
+OUTPUTS_DIR = "outputs"
+CROP_PADDING = 100
+RING_OVERLAY_ALPHA = 80
+
+def get_output_paths(run_id: str, version_id: str):
+    run_base = Path(OUTPUTS_DIR) / f"{run_id}"
+    version_base = run_base / "versions" / f"{version_id}"
+    return {
+        "run": run_base,
+        "version": version_base,
+        "debug_cells": run_base / "debug/cells",
+        "overlay": run_base / "debug",
+        "metadata": run_base / "metadata.json",
+        "source_metadata": version_base / "source_metadata.json",
+        "crops": run_base / "crops",
+        "csv": version_base / "pairs_metadata.csv",
+    }
+# evaluate/thresholding.py
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import f1_score
+from skimage.filters import threshold_otsu
+
+def suggest_otsu_threshold(scores):
+    return threshold_otsu(np.array(scores))
+
+def suggest_best_f1_threshold(scores, labels):
+    labels = pd.Series(labels).map({'bad': 0, 'good': 1}).values  # ADD THIS LINE
+    best_thresh = 0.5
+    best_f1 = 0
+    thresholds = np.linspace(0.0, 1.0, 200)
+
+    for t in thresholds:
+        preds = [s >= t for s in scores]
+        f1 = f1_score(labels, preds)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = t
+    return best_thresh, best_f1
+# evaluation/evaluate.py
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # Use non-GUI backend for headless environments
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, roc_auc_score, roc_curve, precision_recall_curve
+from pipeline.logger import get_logger
+from pathlib import Path
+from evaluate.thresholding import suggest_otsu_threshold, suggest_best_f1_threshold
+
+log = get_logger(__name__)
+
+def evaluate_pairs(csv_path, out_dir=None):
+    df = pd.read_csv(csv_path)
+    if 'label' not in df.columns or 'score' not in df.columns:
+        raise ValueError("CSV must contain 'label' and 'score' columns")
+
+    df = df[df['label'].isin(['good', 'bad'])].dropna(subset=['score'])
+    if df.empty:
+        raise ValueError("No labeled examples found for evaluation")
+
+    if "label" in df.columns:
+        thresh, f1 = suggest_best_f1_threshold(df["score"], df["label"])
+        log.info(f"Suggested threshold (F1 max): {thresh:.3f} (F1 = {f1:.2f})")
+
+    y_true = df['label'].map({'bad': 0, 'good': 1}).values
+    y_score = df['score'].values
+    y_pred = (y_score >= thresh).astype(int)
+
+    print("\n🔍 Classification Report:")
+    print(classification_report(y_true, y_pred, target_names=['bad', 'good'], digits=3))
+
+    try:
+        auc = roc_auc_score(y_true, y_score)
+        print(f"AUC: {auc:.3f}")
+    except Exception as e:
+        log.warning(f"AUC computation failed: {e}")
+
+    plot_score_distributions(df, out_dir)
+    plot_roc_pr_curves(y_true, y_score, out_dir)
+
+def plot_score_distributions(df, out_dir=None):
+    plt.figure(figsize=(6, 4))
+    df_good = df[df["label"] == "good"]
+    df_bad = df[df["label"] == "bad"]
+    plt.hist(df_good["score"], bins=20, alpha=0.5, label="good", color="green")
+    plt.hist(df_bad["score"], bins=20, alpha=0.5, label="bad", color="red")
+    plt.xlabel("Score")
+    plt.ylabel("Count")
+    plt.title("Score Distribution by Label")
+    plt.legend()
+    plt.tight_layout()
+    if out_dir:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        plt.savefig(Path(out_dir) / "score_distribution.png", dpi=300)
+    else:
+        plt.show()
+    plt.close()
+
+def plot_roc_pr_curves(y_true, y_score, out_dir=None):
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    prec, rec, _ = precision_recall_curve(y_true, y_score)
+
+    plt.figure(figsize=(12, 4))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(fpr, tpr, label="ROC")
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve")
+    plt.grid(True)
+
+    plt.subplot(1, 2, 2)
+    plt.plot(rec, prec, label="PR")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curve")
+    plt.grid(True)
+
+    plt.tight_layout()
+
+    if out_dir:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        plt.savefig(Path(out_dir) / "roc_pr_curves.png", dpi=300)
+    else:
+        plt.show()
+    plt.close()
+# pipeline/apply_cnn.py
+
+import pandas as pd
+import torch
+import numpy as np
+from pathlib import Path
+from PIL import Image, ImageDraw
+from torchvision import transforms
+from sklearn.metrics import classification_report
+import json
+from datetime import datetime
+
+from pipeline.utils import load_cnn_model
+
+from config import get_output_paths
+from pipeline.logger import get_logger
+from evaluation.evaluate import evaluate_pairs
+
+log = get_logger(__name__)
+
+
+def apply_cnn_model(csv_path, model_path, device="cpu", threshold=0.5, evaluate=True):
+    csv_path = Path(csv_path).resolve()
+    model_path = Path(model_path).resolve()
+
+    df = pd.read_csv(csv_path)
+    crop_dir = csv_path.parent / "crops"
+    df = df[df["cell_label"].notna()]
+    img_paths = df["cell_label"].apply(lambda cid: crop_dir / f"cell_{int(cid):03d}.png")
+
+    # Extract run/version IDs
+    version_dir = csv_path.parent
+    versions_root = version_dir.parent
+    run_dir = versions_root.parent
+    run_id = run_dir.name.split("_")[-1]
+    version_id = get_next_version_id(versions_root)
+
+    # Create new output paths
+    paths = get_output_paths(run_id, version_id)
+    paths["version"].mkdir(parents=True, exist_ok=True)
+    paths["crops"].mkdir(parents=True, exist_ok=True)
+
+    # Prepare CNN
+
+    model = load_cnn_model(model_path, device)
+
+    transform = transforms.Compose([
+        transforms.Resize((128, 128)),
+        transforms.ToTensor()
+    ])
+
+    # Score and annotate
+    scores = []
+    for idx, (cid, crop_path) in enumerate(zip(df["cell_label"], img_paths)):
+        if not crop_path.exists():
+            log.warning(f"Missing crop: {crop_path}")
+            scores.append(np.nan)
+            continue
+
+        img = Image.open(crop_path).convert("RGB")
+        x = transform(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            prob = torch.softmax(model(x), dim=1)[0, 1].item()
+        scores.append(prob)
+
+        # Overlay
+        label = "good" if prob >= threshold else "bad"
+        color = (0, 255, 0) if label == "good" else (255, 0, 0)
+        draw = ImageDraw.Draw(img)
+        draw.text((5, 5), f"{label} ({prob:.2f})", fill=color + (255,))
+        save_path = paths["crops"] / f"cell_{int(cid):03d}_cnn_overlay.png"
+        img.save(save_path)
+        log.debug(f"Overlay saved: {save_path}")
+
+    df["score"] = scores
+    out_csv = paths["csv"]
+    df.to_csv(out_csv, index=False)
+    log.info(f"✅ Rescored {df.shape[0]} cells with CNN and saved to {out_csv}")
+
+    # Save metadata
+    metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "run_id": run_id,
+        "version_id": version_id,
+        "model_path": str(model_path),
+        "input_csv": str(csv_path),
+        "output_csv": str(out_csv),
+        "threshold": threshold,
+        "device": device
+    }
+
+    with open(paths["version"] / "cnn_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    log.info(f"Saved CNN scoring metadata to {paths['version'] / 'cnn_metadata.json'}")
+
+    # Optional evaluation
+    if evaluate:
+        try:
+            evaluate_pairs(out_csv)
+        except Exception as e:
+            log.warning(f"Evaluation failed: {e}")
+
+
+def get_next_version_id(versions_root, prefix="version"):
+    versions_root = Path(versions_root)
+    versions_root.mkdir(parents=True, exist_ok=True)
+    version_dirs = [p.name for p in versions_root.iterdir() if p.is_dir() and p.name.startswith(prefix)]
+    version_nums = [int(d[len(prefix) + 1:]) for d in version_dirs if d[len(prefix):].lstrip("_").isdigit()]
+    next_id = max(version_nums, default=0) + 1
+    return f"{next_id:03d}"
+import pandas as pd
+from pipeline.feature_extraction import extract_ring_features
+from pipeline.logger import get_logger
+from pipeline.visualize import save_ring_crop
+from typing import List
+from pipeline.sample import CellSample
+
+from concurrent.futures import ThreadPoolExecutor
+
+log = get_logger(__name__)
+
+def export_protein_ring_pairs(
+    samples: List[CellSample],
+    scorer,
+    paths,
+    condition_label=None,
+    source_img=None,
+    run_id=None,
+    version_id=None,
+    skip_crops=False,
+):
+    crop_dir = paths["crops"]
+    csv_path = paths["csv"]
+    crop_dir.mkdir(parents=True, exist_ok=True)
+
+    ring_samples = [s for s in samples if s.has_ring()]
+    if not ring_samples:
+        log.warning("No ring-positive cells found. Skipping export.")
+        return
+
+    rows = []
+    for sample in ring_samples:
+        features = extract_ring_features(
+            sample.region,
+            sample._membrane_img,
+            sample._norm_protein,
+            sample.ring_mask,
+            sample._frangi_img,
+        )
+        if features is None:
+            log.debug(f"Cell {sample.cell_id}: No features extracted.")
+            continue
+
+        sample.set_features(features)
+        score = scorer.score(features)
+        sample.set_score(score)
+
+        sample.meta.update({
+            "condition": condition_label,
+            "source_img": source_img,
+            "run_id": run_id,
+            "version_id": version_id,
+        })
+
+        rows.append(sample.to_row())
+
+    if not rows:
+        log.warning("No protein+ring pairs were exported.")
+        return
+
+    df = pd.DataFrame(rows)
+    if "label" in df.columns:
+        cols = df.columns.tolist()
+        cols.insert(0, cols.pop(cols.index("label")))
+        df = df[cols]
+
+    if csv_path.exists():
+        df_existing = pd.read_csv(csv_path)
+        df_combined = pd.concat([df_existing, df], ignore_index=True).drop_duplicates(subset=["cell_label"])
+    else:
+        df_combined = df
+
+    df_combined.to_csv(csv_path, index=False)
+    log.info(f"✅ Exported {len(df)} new cells to {csv_path.resolve()}")
+
+    if not skip_crops:
+        max_id = max(s.cell_id for s in ring_samples)
+        pad_width = max(4, len(str(max_id)))
+
+        def export_crop(sample):
+            out_path = crop_dir / f"cell_{sample.cell_id:0{pad_width}d}.png"
+            save_ring_crop(sample._norm_protein, sample.ring_mask, sample.cell_mask, out_path)
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            executor.map(export_crop, ring_samples)# pipeline/feature_extraction.py
+import numpy as np
+from pipeline.logger import get_logger
+from skimage.morphology import binary_erosion, binary_dilation, disk
+
+from pipeline.metrics_registry import compute_registered_metrics
+
+from typing import List
+from pipeline.sample import CellSample
+
+log = get_logger(__name__)
+
+def extract_features_for_samples(samples: List[CellSample], membrane_img: np.ndarray, protein_img: np.ndarray, frangi_img: np.ndarray = None ):
+    for sample in samples:
+        if not sample.has_ring():
+            log.debug(f"Cell {sample.cell_id}: No ring — skipping feature extraction.")
+            continue
+
+        features = extract_ring_features(
+            sample.region,
+            membrane_img,
+            protein_img,
+            sample.ring_mask,
+            frangi_img,
+        )
+
+        if features:
+            sample.set_features(features)
+        else:
+            log.debug(f"Cell {sample.cell_id}: Feature extraction failed.")
+
+def extract_ring_features(region, membrane_img, protein_img, ring_mask, frangi_img=None):
+    minr, minc, maxr, maxc = region.bbox
+    ring = ring_mask[minr:maxr, minc:maxc]
+    cell_mask = region.image
+
+    if not np.any(ring):
+        return {}
+
+    features = {}
+
+    # Core intensity values
+    protein_crop = protein_img[minr:maxr, minc:maxc]
+    ring_vals = protein_crop[ring]
+    cell_vals = protein_crop[cell_mask]
+
+    features["protein_mean"] = np.mean(ring_vals)
+    features["protein_std"] = np.std(ring_vals)
+
+    # Frangi features
+    if frangi_img is not None:
+        frangi_vals = frangi_img[minr:maxr, minc:maxc][ring]
+        features["frangi_mean"] = np.mean(frangi_vals)
+        features["frangi_std"] = np.std(frangi_vals)
+
+    # Shape
+    features["area"] = region.area
+    features["eccentricity"] = region.eccentricity
+    features["solidity"] = region.solidity
+    features["ring_area"] = float(np.sum(ring))
+
+    # Create inner and outer ring masks for enrichment calculations
+    inner = binary_erosion(cell_mask, disk(3))
+    outer = binary_dilation(cell_mask, disk(3)) ^ cell_mask
+
+    inner_vals = protein_crop[inner]
+    outer_vals = protein_crop[outer]
+
+    features["ring_inner_diff"] = features["protein_mean"] - np.mean(inner_vals) if inner_vals.size else 0
+    features["ring_inner_ratio"] = features["protein_mean"] / (np.mean(inner_vals) + 1e-6)
+    features["ring_outer_diff"] = features["protein_mean"] - np.mean(outer_vals) if outer_vals.size else 0
+    features["ring_outer_ratio"] = features["protein_mean"] / (np.mean(outer_vals) + 1e-6)
+
+    # Add dynamic metrics from registry
+    dynamic = compute_registered_metrics(region, protein_crop, ring, inner, outer)
+    features.update(dynamic)
+
+    return features# pipeline/logger.py
+import logging
+
+def get_logger(name):
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+    return logger
+# pipeline/metrics_registry.py
+
+import numpy as np
+from skimage.morphology import binary_dilation, disk
+from pipeline.logger import get_logger
+
+log = get_logger(__name__)
+
+_ring_metric_registry = {}
+
+def ring_metric(func):
+    _ring_metric_registry[func.__name__] = func
+    return func
+
+def compute_registered_metrics(region, protein_img, ring_mask, inner_mask, outer_mask):
+    metrics = {}
+    for name, func in _ring_metric_registry.items():
+        try:
+            metrics[name] = float(func(region, protein_img, ring_mask, inner_mask, outer_mask))
+        except Exception as e:
+            log.warning(f"Metric '{name}' failed: {e}")
+    return metrics
+
+@ring_metric
+def ring_total_fraction(region, protein_crop, ring, *_):
+    """Total protein in ring vs entire cell."""
+    ring_sum = protein_crop[ring].sum()
+    cell_sum = protein_crop[region.image].sum()
+    return ring_sum / (cell_sum + 1e-6)
+
+@ring_metric
+def ring_contrast(region, protein_crop, ring, inner, *_):
+    """Normalized contrast of ring vs cytoplasm."""
+    ring_mean = protein_crop[ring].mean()
+    inner_mean = protein_crop[inner].mean() if inner.any() else 0
+    return (ring_mean - inner_mean) / (ring_mean + inner_mean + 1e-6)
+
+@ring_metric
+def ring_cv(region, protein_crop, ring, *_):
+    """Coefficient of variation in the ring region."""
+    vals = protein_crop[ring]
+    return np.std(vals) / (np.mean(vals) + 1e-6)
+
+@ring_metric
+def membrane_vs_cytoplasm(region, protein_img, ring, *_):
+    cell_mask = region.image  # whole cell
+    membrane = ring           # ring mask represents membrane
+    cytoplasm = cell_mask.copy()
+    cytoplasm[membrane] = False  # exclude membrane to get cytoplasm
+
+    mem_intensity = protein_img[membrane].mean()
+    cyt_intensity = protein_img[cytoplasm].mean()
+
+    return mem_intensity / (cyt_intensity + 1e-6)
+# pipeline/ring_detection.py
+import numpy as np
+from skimage.filters import sobel
+from skimage.morphology import binary_erosion, binary_dilation, disk
+from config import (
+    RING_SCALES,
+    RING_DILATE_PX,
+    RING_PERCENTILE_CUTOFF,
+)
+from pipeline.utils import normalize_image
+from pipeline.logger import get_logger
+
+from typing import List
+from pipeline.sample import CellSample
+
+log = get_logger(__name__)
+
+# def extract_rings(membrane_img, samples: List[CellSample], protein_img=None, scorer=None, frangi_img=None, debug=False, debug_dir=None) -> np.ndarray:
+    
+#     ring_mask = np.zeros_like(membrane_img, dtype=bool)
+#     mem_norm = normalize_image(membrane_img)
+#     mem_edges = sobel(mem_norm)
+
+#     for sample in samples:
+#         region = sample.region
+
+#         minr, minc, maxr, maxc = region.bbox
+#         submask = region.image
+#         est_radius = np.sqrt(region.area / np.pi)
+#         radii = [max(1, int(scale * est_radius)) for scale in RING_SCALES]
+
+#         ring_union = np.zeros_like(submask, dtype=bool)
+#         for r in radii:
+#             inner = binary_erosion(submask, disk(r))
+#             ring = submask ^ inner
+#             ring_union |= ring
+
+#         if not ring_union.any():
+#             if debug:
+#                 log.debug(f"Cell {sample.cell_id}: No ring after erosion.")
+#                 if debug and debug_dir:
+#                     sample.save_debug(protein_img, membrane_img, ring_mask, out_dir=debug_dir)
+#             continue
+
+#         edge_vals = mem_edges[minr:maxr, minc:maxc][ring_union]
+#         score_fraction = np.mean(edge_vals > 0)
+
+#         if score_fraction < 0.5:  # <- this can be a configurable cutoff later
+#             if debug:
+#                 log.debug(f"Cell {sample.cell_id}: Low edge fraction.")
+#                 if debug and debug_dir:
+#                     sample.save_debug(protein_img, membrane_img, ring_mask, out_dir=debug_dir)
+#             continue
+
+#         cutoff = np.percentile(edge_vals, RING_PERCENTILE_CUTOFF)
+#         selected = edge_vals > cutoff
+#         coords = np.where(ring_union)
+#         selected_y = coords[0][selected]
+#         selected_x = coords[1][selected]
+
+#         if len(selected_y) < 15:
+#             if debug:
+#                 log.debug(f"Cell {sample.cell_id}: Ring too small.")
+#                 if debug and debug_dir:
+#                     sample.save_debug(protein_img, membrane_img, ring_mask, out_dir=debug_dir)
+#             continue
+
+#         # Update the full image ring_mask
+#         ring_mask[minr + selected_y, minc + selected_x] = True
+
+#         # Create per-cell ring and attach to sample
+#         cell_ring = np.zeros_like(sample.cell_mask, dtype=bool)
+#         cell_ring[minr:maxr, minc:maxc][selected_y, selected_x] = True
+#         sample.set_ring_mask(cell_ring)
+
+#         if debug:
+#             log.debug(f"Cell {sample.cell_id}: ring area = {len(selected_y)}")
+#             if debug and debug_dir:
+#                 sample.save_debug(protein_img, membrane_img, ring_mask, out_dir=debug_dir)
+
+#     if RING_DILATE_PX > 0:
+#         ring_mask = binary_dilation(ring_mask, disk(RING_DILATE_PX))
+
+#     return ring_mask
+
+
+
+from config import RING_WIDTH_SCALE, RING_WIDTH_MIN, RING_WIDTH_MAX, RING_DILATE_PX, RING_INTENSITY_CUTOFF
+
+def extract_rings(membrane_img, samples: List[CellSample], protein_img=None, scorer=None, frangi_img=None, debug=False, debug_dir=None) -> np.ndarray:
+    ring_mask = np.zeros_like(membrane_img, dtype=bool)
+    mem_norm = normalize_image(membrane_img)
+
+    for sample in samples:
+        region = sample.region
+        minr, minc, maxr, maxc = region.bbox
+        submask = region.image
+
+        # Dynamically estimate ring width
+        est_radius = np.sqrt(region.area / np.pi)
+        ring_width = int(est_radius * RING_WIDTH_SCALE)
+        ring_width = max(RING_WIDTH_MIN, min(ring_width, RING_WIDTH_MAX))
+
+        outer = binary_dilation(submask, disk(ring_width))
+        inner = binary_erosion(submask, disk(ring_width))
+        local_ring = outer ^ inner
+
+        if local_ring.shape != submask.shape:
+            log.warning(f"Cell {sample.cell_id}: shape mismatch in ring mask.")
+            continue
+
+        if not local_ring.any():
+            if debug:
+                log.debug(f"Cell {sample.cell_id}: Empty ring mask.")
+                sample.save_debug(protein_img, membrane_img, ring_mask, out_dir=debug_dir)
+            continue
+
+        mem_crop = mem_norm[minr:maxr, minc:maxc]
+        if mem_crop.shape != local_ring.shape:
+            log.warning(f"Cell {sample.cell_id}: shape mismatch between membrane crop and ring.")
+            continue
+
+        ring_vals = mem_crop[local_ring]
+        if ring_vals.size == 0:
+            if debug:
+                log.debug(f"Cell {sample.cell_id}: No pixels in ring_crop.")
+                sample.save_debug(protein_img, membrane_img, ring_mask, out_dir=debug_dir)
+            continue
+
+        cutoff = np.percentile(ring_vals, RING_INTENSITY_CUTOFF)
+        selected = ring_vals > cutoff
+        coords = np.where(local_ring)
+        selected_y = coords[0][selected]
+        selected_x = coords[1][selected]
+
+        if len(selected_y) < 15:
+            if debug:
+                log.debug(f"Cell {sample.cell_id}: Ring too small after thresholding.")
+                sample.save_debug(protein_img, membrane_img, ring_mask, out_dir=debug_dir)
+            continue
+
+        # Update full-image ring mask
+        ring_mask[minr + selected_y, minc + selected_x] = True
+
+        # Per-cell ring mask
+        cell_ring = np.zeros_like(sample.cell_mask, dtype=bool)
+        cell_ring[minr:maxr, minc:maxc][selected_y, selected_x] = True
+        sample.set_ring_mask(cell_ring)
+
+        if debug:
+            log.debug(f"Cell {sample.cell_id}: ring width = {ring_width}, area = {len(selected_y)}")
+            sample.save_debug(protein_img, membrane_img, ring_mask, out_dir=debug_dir)
+
+    if RING_DILATE_PX > 0:
+        ring_mask = binary_dilation(ring_mask, disk(RING_DILATE_PX))
+
+    return ring_mask
+from dataclasses import dataclass, field
+import numpy as np
+from pathlib import Path
+from typing import Optional, Dict, Any
+from PIL import Image, ImageDraw
+
+from config import CROP_PADDING
+from pipeline.logger import get_logger
+
+log = get_logger(__name__)
+
+@dataclass
+class CellSample:
+    cell_id: int
+    region: object
+    cell_mask: np.ndarray
+    ring_mask: Optional[np.ndarray] = None
+    features: Optional[Dict[str, float]] = None
+    score: Optional[float] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    def bounding_box(self):
+        return self.region.bbox
+
+    def centroid(self):
+        return self.region.centroid
+
+    def crop(self, image: np.ndarray) -> np.ndarray:
+        minr, minc, maxr, maxc = self.bounding_box()
+        return image[minr:maxr, minc:maxc]
+
+    def ring_crop(self) -> Optional[np.ndarray]:
+        if self.ring_mask is not None:
+            return self.crop(self.ring_mask)
+        return None
+
+    def to_row(self) -> Dict[str, Any]:
+        return {
+            "cell_label": self.cell_id,
+            "score": self.score,
+            **(self.features or {}),
+            **self.meta,
+            "bbox_minr": self.region.bbox[0],
+            "bbox_minc": self.region.bbox[1],
+            "bbox_maxr": self.region.bbox[2],
+            "bbox_maxc": self.region.bbox[3],
+        }
+
+    def has_ring(self) -> bool:
+        return self.ring_mask is not None and np.any(self.ring_mask)
+
+    def set_score(self, score: float):
+        self.score = float(score)
+
+    def set_features(self, features: Dict[str, float]):
+        self.features = features
+
+    def set_ring_mask(self, ring_mask: np.ndarray):
+        self.ring_mask = ring_mask
+
+    def save_debug(self, protein_img, membrane_img, ring_mask, out_dir):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        center_r, center_c = np.round(self.region.centroid).astype(int)
+        minr = max(center_r - CROP_PADDING, 0)
+        maxr = min(center_r + CROP_PADDING, protein_img.shape[0])
+        minc = max(center_c - CROP_PADDING, 0)
+        maxc = min(center_c + CROP_PADDING, protein_img.shape[1])
+
+        def crop(img): return img[minr:maxr, minc:maxc]
+
+        protein_crop = crop(protein_img)
+        membrane_crop = crop(membrane_img)
+        ring_crop = crop((ring_mask & self.cell_mask).astype(np.uint8))
+        cell_crop = crop(self.cell_mask.astype(np.uint8))
+
+        def to_rgb(normed, channel="green", alpha=0.6):
+            base = (normed * 255).astype(np.uint8)
+            blank = np.zeros_like(base)
+            if channel == "green":
+                return np.stack([blank, (base * alpha).astype(np.uint8), blank], axis=-1)
+            if channel == "red":
+                return np.stack([(base * alpha).astype(np.uint8), blank, blank], axis=-1)
+
+        def save_rgb(data, path):
+            Image.fromarray(data).save(out_dir / path)
+
+        save_rgb(to_rgb((protein_crop - protein_crop.min()) / (np.ptp(protein_crop) + 1e-6), "green"), f"cell_{self.cell_id:03d}_protein.png")
+        save_rgb(to_rgb((membrane_crop - membrane_crop.min()) / (np.ptp(membrane_crop) + 1e-6), "red"), f"cell_{self.cell_id:03d}_membrane.png")
+
+        # Overlay image
+        base = Image.fromarray(to_rgb((protein_crop - protein_crop.min()) / (np.ptp(protein_crop) + 1e-6), "green"))
+        overlay = base.convert("RGBA")
+        draw = ImageDraw.Draw(overlay, "RGBA")
+
+        for y, x in zip(*np.where(cell_crop)):
+            draw.point((x, y), fill=(255, 255, 0, 60))  # yellow
+        for y, x in zip(*np.where(ring_crop)):
+            draw.point((x, y), fill=(255, 0, 255, 160))  # magenta
+
+        overlay.save(out_dir / f"cell_{self.cell_id:03d}_overlay.png")
+        log.debug(f"Saved per-cell debug overlay for cell {self.cell_id}")
+
+    @classmethod
+    def from_region(cls, region, label_img):
+        mask = (label_img == region.label)
+        return cls(cell_id=region.label, region=region, cell_mask=mask)# pipeline/scorer.py
+from abc import ABC, abstractmethod
+import numpy as np
+import json
+from pipeline.logger import get_logger
+from pipeline.utils import load_cnn_model
+
+
+log = get_logger(__name__)
+
+
+class BaseScorer(ABC):
+    @abstractmethod
+    def score(self, features: dict) -> float:
+        pass
+
+
+class RuleBasedScorer(BaseScorer):
+    def __init__(self, weights: dict, bias: float = 0.0):
+        self.weights = weights
+        self.bias = bias
+
+    def score(self, features: dict) -> float:
+        score = self.bias
+        for k, w in self.weights.items():
+            if k not in features:
+                log.warning(f"Missing feature '{k}' in input — using 0")
+                continue
+            score += w * features.get(k, 0)
+        return score
+
+    def to_dict(self):
+        return {
+            "weights": self.weights,
+            "bias": self.bias
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(weights=d["weights"], bias=d.get("bias", 0))
+
+    def save(self, path):
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+        log.debug(f"RuleBasedScorer saved to {path}")
+
+    @staticmethod
+    def load(path):
+        with open(path) as f:
+            d = json.load(f)
+        return RuleBasedScorer.from_dict(d)
+
+
+class MLScorer(BaseScorer):
+    def __init__(self, model, feature_order):
+        self.model = model
+        self.feature_order = feature_order
+
+    def score(self, features: dict) -> float:
+        x = np.array([[features.get(f, 0.0) for f in self.feature_order]])
+        score = self.model.predict_proba(x)[0][1]  # prob of class 1
+        return float(score)
+
+    def save(self, path):
+        import joblib
+        joblib.dump({"model": self.model, "feature_order": self.feature_order}, path)
+        log.debug(f"MLScorer saved to {path}")
+
+    @staticmethod
+    def load(path):
+        import joblib
+        d = joblib.load(path)
+        return MLScorer(model=d["model"], feature_order=d["feature_order"])
+
+class CNNScorer(BaseScorer):
+    def __init__(self, model_path, device="cpu"):
+        self.device = device
+        self.model = load_cnn_model(model_path, device)
+
+        from torchvision import transforms
+        self.transform = transforms.Compose([
+            transforms.Resize((128, 128)),
+            transforms.ToTensor()
+        ])
+
+    def score(self, image: np.ndarray) -> float:
+        from PIL import Image
+        import torch
+
+        pil = Image.fromarray((image * 255).astype(np.uint8)).convert("RGB")
+        x = self.transform(pil).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            probs = torch.softmax(self.model(x), dim=1).cpu().numpy()[0]
+        return float(probs[1])  # prob of class "good"
+# pipeline/segmentation.py
+import numpy as np
+from skimage.morphology import remove_small_objects
+from cellpose import models
+from config import CELLPOSE_MODEL_TYPE, CELLPOSE_DIAMETER, CELLPOSE_MIN_AREA
+from pipeline.logger import get_logger
+
+log = get_logger(__name__)
+
+def segment_cells(img: np.ndarray, out_dir="debug_segmentation", debug=False) -> np.ndarray:
+    # Initialize Cellpose model
+    model = models.Cellpose(model_type=CELLPOSE_MODEL_TYPE)
+    
+    # Perform segmentation with Cellpose
+    masks, _, _, _ = model.eval(img, diameter=CELLPOSE_DIAMETER, channels=[0, 0])
+    
+    # Clean small objects
+    cleaned = remove_small_objects(masks.astype(np.int32), min_size=CELLPOSE_MIN_AREA)
+
+    if debug:
+        for cell_id in np.unique(cleaned):
+            if cell_id == 0: continue  # Skip background
+
+    return cleaned
+# pipeline/train.py
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
+
+from pipeline.train_helpers import (
+    prepare_features,
+    save_model_and_metadata,
+    apply_model_to_run,
+)
+from pipeline.utils import get_next_version_id
+from pipeline.logger import get_logger
+from pathlib import Path
+
+log = get_logger(__name__)
+
+def train_classifier(csv_path, rescore=False):
+    csv_path = Path(csv_path).resolve()
+    X, y, df = prepare_features(csv_path)
+
+    log.info(f"Training on {len(X)} labeled samples...")
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, stratify=y, test_size=0.2, random_state=42
+    )
+
+    model = RandomForestClassifier(
+        n_estimators=200, max_depth=10, class_weight="balanced", random_state=42
+    )
+    model.fit(X_train, y_train)
+    preds = model.predict(X_val)
+
+    log.info("Validation report:")
+    print(classification_report(y_val, preds))
+
+    # Determine where to save
+    version_dir = csv_path.parent
+    run_dir = version_dir.parent.parent
+    run_id = run_dir.name
+
+    if rescore:
+        version_id = get_next_version_id(run_dir / "versions")
+        log.info(f"Applying trained model to same run (→ version {version_id})...")
+        apply_model_to_run(model, list(X.columns), run_id, version_id, original_csv=csv_path, skip_crops=True)
+    else:
+        version_id = version_dir.name
+
+    save_model_and_metadata(model, X.columns, csv_path, run_id, version_id)
+# pipeline/train_grid.py
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.metrics import classification_report
+
+from pipeline.train_helpers import (
+    prepare_features,
+    save_model_and_metadata,
+    apply_model_to_run,
+)
+from pipeline.utils import get_next_version_id
+from pipeline.logger import get_logger
+from pathlib import Path
+
+log = get_logger(__name__)
+
+def train_model_with_grid(csv_path, rescore=False):
+    csv_path = Path(csv_path).resolve()
+    X, y, df = prepare_features(csv_path)
+
+    log.info(f"Training with grid search on {len(X)} labeled samples...")
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, stratify=y, test_size=0.2, random_state=42
+    )
+
+    param_grid = {
+        "n_estimators": [100, 200],
+        "max_depth": [None, 10, 20],
+        "min_samples_split": [2, 5],
+        "max_features": ["sqrt", None],
+        "class_weight": [None, "balanced"],
+    }
+
+    clf = GridSearchCV(
+        RandomForestClassifier(random_state=42),
+        param_grid,
+        scoring="f1",
+        cv=3,
+        n_jobs=-1,
+        verbose=1,
+    )
+    clf.fit(X_train, y_train)
+    best_model = clf.best_estimator_
+
+    log.info("Best parameters:")
+    for k, v in clf.best_params_.items():
+        log.info(f"  {k}: {v}")
+
+    preds = best_model.predict(X_val)
+    log.info("Validation report:")
+    print(classification_report(y_val, preds))
+
+    version_dir = csv_path.parent
+    run_dir = version_dir.parent.parent
+    run_id = run_dir.name
+
+    if rescore:
+        version_id = get_next_version_id(run_dir / "versions")
+        log.info(f"Applying best model to same run (→ version {version_id})...")
+        apply_model_to_run(best_model, list(X.columns), run_id, version_id, original_csv=csv_path, skip_crops=True)
+    else:
+        version_id = version_dir.name
+
+    save_model_and_metadata(
+        best_model,
+        X.columns,
+        csv_path,
+        run_id,
+        version_id,
+        extra_metadata={"grid": param_grid}
+    )
+# pipeline/train_helpers.py
+import pandas as pd
+import joblib
+import json
+from datetime import datetime
+from pathlib import Path
+from sklearn.preprocessing import LabelEncoder
+
+from config import get_output_paths, MIN_CELL_AREA
+from pipeline.logger import get_logger
+from pipeline.export import export_protein_ring_pairs
+from pipeline.utils import normalize_image
+from pipeline.scorer import MLScorer
+from pipeline.sample import CellSample
+from pipeline.ring_detection import extract_rings
+from skimage.filters import frangi
+from skimage.measure import regionprops
+
+from PIL import Image
+from pipeline.visualize import tile_images
+
+from pipeline.segmentation import segment_cells
+from pipeline.utils import load_tiff_channels
+
+log = get_logger(__name__)
+
+NON_FEATURE_COLS = {
+    "label", "score", "cell_label",
+    "run_id", "version_id", "condition", "source_img",
+    "bbox_minr", "bbox_minc", "bbox_maxr", "bbox_maxc"
+}
+
+def prepare_features(csv_path):
+    df = pd.read_csv(csv_path)
+    if "label" not in df.columns:
+        raise ValueError("CSV must include a 'label' column.")
+
+    df = df.dropna(subset=["label"])
+    y = LabelEncoder().fit_transform(df["label"])
+    X = df.drop(columns=[c for c in df.columns if c in NON_FEATURE_COLS], errors="ignore")
+    X = X.select_dtypes(include=[float, int])
+    return X, y, df
+
+def save_model_and_metadata(model, X_cols, csv_path, run_id, version_id, model_path_suffix="model.pkl", extra_metadata=None):
+    version_dir = Path(get_output_paths(run_id, version_id)["version"])
+    version_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = version_dir / model_path_suffix
+    joblib.dump({"model": model, "feature_order": list(X_cols)}, model_path)
+    log.info(f"Model saved to {model_path}")
+
+    metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "csv_used": str(csv_path),
+        "model_path": str(model_path),
+        "features": list(X_cols),
+        "run_id": run_id,
+        "version_id": version_id,
+        **(extra_metadata or {})
+    }
+
+    with open(version_dir / "train_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    log.info(f"Metadata saved to {version_dir / 'train_metadata.json'}")
+
+def apply_model_to_run(model, feature_order, run_id, version_id, original_csv=None, skip_crops=True):
+
+    paths = get_output_paths(run_id, version_id)
+    paths["version"].mkdir(parents=True, exist_ok=True)
+
+    # 🔍 Find detect-export metadata
+    versions_dir = paths["run"] / "versions"
+    source_meta = None
+    for version_path in sorted(versions_dir.glob("*/source_metadata.json")):
+        with open(version_path) as f:
+            meta = json.load(f)
+            if "inputs" in meta:
+                source_meta = meta
+                break
+
+    if not source_meta:
+        raise FileNotFoundError(f"Could not find source_metadata.json in {versions_dir}")
+
+    tiff_paths = [Path(entry["tif"]) for entry in source_meta.get("inputs", [])]
+
+    scorer = MLScorer(model, feature_order)
+    all_samples = []
+
+    for tif_path in tiff_paths:
+        log.info(f"🔁 Rescoring {tif_path}")
+        protein_img, membrane_img = load_tiff_channels(tif_path)
+        norm_membrane = normalize_image(membrane_img)
+        norm_protein = normalize_image(protein_img)
+        frangi_img = frangi(norm_membrane)
+
+        cell_labels = segment_cells(norm_membrane, debug=False)
+        samples = []
+        for region in regionprops(cell_labels):
+            if region.area >= MIN_CELL_AREA:
+                sample = CellSample(cell_id=region.label, region=region, cell_mask=(cell_labels == region.label))
+                sample._membrane_img = membrane_img
+                sample._norm_protein = norm_protein
+                sample._frangi_img = frangi_img
+
+                sample.meta.update({
+                    "source_img": str(tif_path),
+                    "run_id": run_id,
+                    "version_id": version_id,
+                })
+
+                samples.append(sample)
+
+        ring_mask = extract_rings(
+            membrane_img, samples, norm_protein, scorer, frangi_img, debug=False
+        )
+
+        for sample in samples:
+            sample.meta.update({
+                "source_img": str(tif_path),
+                "run_id": run_id,
+                "version_id": version_id,
+            })
+
+        all_samples.extend(samples)
+
+    export_protein_ring_pairs(
+        samples=all_samples,
+        scorer=scorer,
+        paths=paths,
+        condition_label=None,
+        source_img="rescored_from_model",
+        run_id=run_id,
+        version_id=version_id,
+        skip_crops=skip_crops,
+    )
+
+
+    if original_csv and Path(original_csv).exists():
+        df_old = pd.read_csv(original_csv)
+        df_new = pd.read_csv(paths["csv"])
+
+        merge_cols = [c for c in ["label", "condition", "source_img"] if c in df_old.columns]
+        if merge_cols:
+            merged = pd.merge(df_new, df_old[["cell_label"] + merge_cols], on="cell_label", how="left")
+            merged = merged.drop_duplicates(subset=["cell_label"], keep="first")
+            merged.to_csv(paths["csv"], index=False)
+            if "label" in merged.columns:
+                cols = merged.columns.tolist()
+                cols.insert(0, cols.pop(cols.index("label")))
+                merged = merged[cols]
+                merged.to_csv(paths["csv"], index=False)
+            log.info(f"Restored metadata columns from {original_csv}")
+        else:
+            log.warning(f"No metadata columns found to restore from {original_csv}")
+
+    out_dir = Path("outputs") / run_id / "versions" / version_id
+    csv_path = out_dir / "pairs_metadata.csv"
+    crop_dir = Path("outputs") / run_id / "crops"
+
+    df = pd.read_csv(csv_path)
+    top = df.sort_values("score", ascending=False).head(100)
+    thumbs = []
+    for _, row in top.iterrows():
+        cell_id = int(row["cell_label"])
+        crop_path = crop_dir / f"cell_{cell_id:04d}.png"
+        if crop_path.exists():
+            thumbs.append(Image.open(crop_path))
+
+    if thumbs:
+        tile = tile_images(thumbs, rows=10, cols=10)
+        tile.save(out_dir / "top100_tile.png")
+        print(f"🖼️  Saved top 100 tile to: {out_dir / 'top100_tile.png'}")# pipeline/utils.py
+
+import numpy as np
+from pathlib import Path
+from pipeline.logger import get_logger
+
+from PIL import Image
+
+import torch
+from torchvision.models import resnet18
+import torch.nn as nn
+import config
+
+log = get_logger(__name__)
+
+
+def load_tiff_channels(tif_path):
+    img = Image.open(tif_path)
+    img.seek(0)
+    protein = np.array(img.copy())
+    img.seek(1)
+    membrane = np.array(img.copy())
+    return protein, membrane
+
+
+def normalize_image(img):
+    method = config.NORM_METHOD.lower()
+    img = img.astype(np.float32)
+
+    if method == "minmax":
+        return (img - img.min()) / (img.max() - img.min() + 1e-8)
+
+    elif method == "percentile":
+        pmin = np.percentile(img, config.PERCENTILE_MIN)
+        pmax = np.percentile(img, config.PERCENTILE_MAX)
+        return np.clip((img - pmin) / (pmax - pmin + 1e-8), 0, 1)
+
+    elif method == "zscore":
+        mean = img.mean()
+        std = img.std()
+        return (img - mean) / (std + 1e-8)
+
+    elif method == "mad":
+        median = np.median(img)
+        mad = np.median(np.abs(img - median))
+        return (img - median) / (mad + 1e-8)
+
+    else:
+        raise ValueError(f"Unknown normalization method: {method}")
+
+
+def get_next_version_id(versions_root, prefix=""):
+    versions_root = Path(versions_root)
+    versions_root.mkdir(parents=True, exist_ok=True)
+
+    version_dirs = [p.name for p in versions_root.iterdir() if p.is_dir()]
+    version_nums = [int(d) for d in version_dirs if d.isdigit()]
+    next_id = max(version_nums, default=0) + 1
+    return f"{next_id:03d}"
+
+def load_cnn_model(model_path, device):
+    model = resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, 2)
+    state_dict = torch.load(model_path, map_location=device, weights_only=False)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.color import label2rgb
+from skimage.measure import regionprops
+from pathlib import Path
+from PIL import Image, ImageDraw
+from pipeline.logger import get_logger
+from config import CROP_PADDING, RING_OVERLAY_ALPHA
+
+log = get_logger(__name__)
+
+def tile_images(images, rows, cols):
+    if not images:
+        raise ValueError("No images to tile.")
+
+    w, h = images[0].size
+    grid = Image.new("RGB", (cols * w, rows * h), "white")
+
+    for idx, img in enumerate(images):
+        if idx >= rows * cols:
+            break
+        x = (idx % cols) * w
+        y = (idx // cols) * h
+        grid.paste(img, (x, y))
+
+    return grid
+
+def overlay_rings(protein_img, membrane_img, cell_labels, ring_mask, out_dir="debug_overlays"):
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    overlay_path = Path(out_dir) / "overlay.png"
+
+    protein_norm = (protein_img - protein_img.min()) / (np.ptp(protein_img) + 1e-6)
+    membrane_norm = (membrane_img - membrane_img.min()) / (np.ptp(membrane_img) + 1e-6)
+
+    base_rgb = np.stack([
+        protein_norm,                  # R = protein
+        membrane_norm,                # G = membrane
+        np.zeros_like(protein_norm)   # B = none
+    ], axis=-1)
+
+    # Apply magenta ring overlay
+    base_rgb[ring_mask] = 0.6 * base_rgb[ring_mask] + 0.4 * np.array([1.0, 0.0, 1.0])
+
+    overlay = label2rgb(cell_labels, image=base_rgb, alpha=0.2, bg_label=0)
+
+    plt.figure(figsize=(10, 10))
+    plt.imshow(overlay)
+    plt.title("Protein + Membrane + Rings + Cells")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(overlay_path, dpi=200)
+    plt.close()
+    log.info(f"Saved global overlay to {overlay_path}")
+
+
+def save_ring_crop(protein_img, ring_mask, cell_mask, out_path, overlay=True, padding=CROP_PADDING, label_text=None, label_color=(255, 255, 255)):
+    """
+    Saves a cropped image centered on a cell, showing only its own ring mask.
+    """
+    # Get bounding box and center from the cell mask
+    
+    props = regionprops(cell_mask.astype(np.uint8))
+    if not props:
+        print("No region found in mask")
+        return
+
+    minr, minc, maxr, maxc = props[0].bbox
+    center_r = (minr + maxr) // 2
+    center_c = (minc + maxc) // 2
+
+    # Expand to centered crop
+    minr = max(center_r - padding, 0)
+    maxr = min(center_r + padding, protein_img.shape[0])
+    minc = max(center_c - padding, 0)
+    maxc = min(center_c + padding, protein_img.shape[1])
+
+    # Get local crop
+    crop = protein_img[minr:maxr, minc:maxc]
+    norm_crop = (crop - crop.min()) / (np.ptp(crop) + 1e-6)
+
+    # Green base image
+    green_img = np.zeros((crop.shape[0], crop.shape[1], 3), dtype=np.uint8)
+    green_img[..., 1] = (norm_crop * 255).astype(np.uint8)
+
+    img = Image.fromarray(green_img)
+
+    if overlay:
+        # Ring + cell intersection to isolate this cell’s ring only
+        ring_crop = (ring_mask & cell_mask)[minr:maxr, minc:maxc]
+        draw = ImageDraw.Draw(img, "RGBA")
+        for y, x in zip(*np.where(ring_crop)):
+            draw.point((x, y), fill=(255, 0, 255, RING_OVERLAY_ALPHA))
+        if label_text:
+            draw.text((5, 5), label_text, fill=label_color + (255,))
+
+    img.save(out_path)
+    print(f"Saved per-cell crop to {out_path}")

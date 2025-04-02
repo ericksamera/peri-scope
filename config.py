@@ -29,6 +29,11 @@ DEFAULT_SCORER = {
     "bias": -0.2
 }
 
+NORM_METHOD = "minmax"  # Options: "minmax", "percentile", "zscore", "mad"
+
+PERCENTILE_MIN = 1
+PERCENTILE_MAX = 99
+
 # Output
 OUTPUTS_DIR = "outputs"
 CROP_PADDING = 100
